@@ -1,6 +1,11 @@
 .test-output/
+.web-stand-in/
 __pycache__/
 *.pyc
 .env
 .env.*
 node_modules/
+.agents/skills/
+.codex/hooks.json
+# 本机任务进度与接续状态，不随公开发布上传。
+/PROJECT_STATE.md

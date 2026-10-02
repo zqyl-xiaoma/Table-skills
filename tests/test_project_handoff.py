@@ -43,7 +43,8 @@ class ReminderTests(unittest.TestCase):
         return m.process(self.event(""), self.root, "status")
 
     def prep(self, reason="count", stage="design", **kw):
-        args = dict(stage_key=stage, safe=True, has_next=True, notice=NOTICE)
+        args = dict(stage_key=stage, safe=True, has_next=True, notice=NOTICE,
+                    benefit=reason == "count")
         args.update(kw)
         return m.process(self.event(""), self.root, "prepare", reason=reason, **args)
 
@@ -55,6 +56,8 @@ class ReminderTests(unittest.TestCase):
         return m.process(event, self.root, "notified", proposal_id=self.pid(), channel=channel)
 
     def reply(self, value, turn="response-a", **kw):
+        self.turn = turn
+        self.hook("UserPromptSubmit")
         args = dict(proposal_id=self.pid(), **kw)
         return m.process(dict(session_id=self.sid, turn_id=turn), self.root,
                          "respond", response=value, **args)
@@ -508,13 +511,142 @@ class ReminderTests(unittest.TestCase):
             self.skipTest("needs Windows and PowerShell 7")
         command = (handlers["PostCompact"]["commandWindows"].replace("<PYTHON_EXE>", sys.executable)
                    .replace("<SKILL_DIRECTORY>", SCRIPT.parents[1].as_posix())
-                   .replace("<CODEX_HOME>", self.root.as_posix()))
+                   .replace("<STATE_DIRECTORY>", (self.root / "state").as_posix()))
         result = subprocess.run([pwsh, "-NoProfile", "-Command", command],
                                 input=json.dumps(self.event("PostCompact", trigger="auto")),
                                 text=True, encoding="utf-8", capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
-        state = m.process(self.event(""), self.root / "state" / "project-handoff", "status")
+        state = m.process(self.event(""), self.root / "state", "status")
         self.assertEqual(state["auto_count"], 1)
+
+    def test_stale_response_cannot_change_current_state(self):
+        self.delivered()
+        self.turn = "turn-new"
+        self.hook("UserPromptSubmit")
+        path = m.state_path(self.root, self.sid)
+        before = path.read_bytes()
+        for response in ("mute", "resume", "continue", "handoff", "defer"):
+            with self.assertRaises(ValueError):
+                m.process(dict(session_id=self.sid, turn_id="turn-a"), self.root,
+                          "respond", response=response, proposal_id=self.pid(), checkpoint_key="done")
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_conflicting_response_in_same_turn_is_rejected(self):
+        self.delivered()
+        self.reply("mute")
+        with self.assertRaises(ValueError):
+            self.reply("resume")
+        self.assertTrue(self.status()["muted"])
+
+    def test_indented_and_inline_code_are_not_final_notices(self):
+        for prefix in ("    ", "\t", "   \t", "`", "<pre>", "> ", "- "):
+            self.assertFalse(m.final_contains_notice(prefix + NOTICE, NOTICE), prefix)
+        self.assertFalse(m.final_contains_notice("```text\nexample\n```\n\n" + NOTICE, NOTICE))
+        self.assertTrue(m.final_contains_notice("\n\n**交接建议：**" + NOTICE[5:] + "\n\n成果", NOTICE))
+
+    def test_indented_code_does_not_start_cooldown(self):
+        self.compact(3)
+        self.prep()
+        self.assertEqual(self.hook("Stop", last_assistant_message="    " + NOTICE)["decision"], "block")
+        self.assertEqual(self.status()["reminder_count"], 0)
+        self.assertEqual(self.status()["next_reminder_at"], 3)
+
+    def test_valid_json_wrong_shape_cli_fails_open_without_replacing_state(self):
+        self.compact()
+        path = m.state_path(self.root, self.sid)
+        original = self.status()
+        corrupt = [[], None, 42, "text"]
+        for field, value in (("evaluation", {"turn_id": 7}), ("proposal", {"id": []}),
+                             ("stop_audit", {"turn_id": "turn-a", "retry_used": "false"}),
+                             ("stage_keys", [{}])):
+            corrupt.append(dict(original, **{field: value}))
+        command = [sys.executable, "-B", "-X", "utf8", str(SCRIPT), "--state-dir", str(self.root)]
+        for value in corrupt:
+            before = json.dumps(value)
+            path.write_text(before, encoding="utf-8")
+            result = subprocess.run(command, input=json.dumps(self.event("PostCompact", trigger="auto")),
+                                    text=True, encoding="utf-8", capture_output=True, timeout=8)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("systemMessage", json.loads(result.stdout))
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_invalid_event_shape_cli_has_structured_warning(self):
+        command = [sys.executable, "-B", "-X", "utf8", str(SCRIPT), "--state-dir", str(self.root)]
+        result = subprocess.run(command, input="[]", text=True, encoding="utf-8", capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("systemMessage", json.loads(result.stdout))
+        self.assertFalse(self.root.exists())
+
+    def test_unrecognized_transcript_metadata_never_counts(self):
+        self.root.mkdir(parents=True)
+        transcript = self.root / "unknown.jsonl"
+        for value in ([], {"type": "metadata-v-next"}, {"type": "session_meta", "payload": []}):
+            transcript.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                self.hook("PostCompact", trigger="auto", transcript_path=str(transcript))
+        self.assertFalse(m.state_path(self.root, self.sid).exists())
+
+    def test_first_count_needs_actual_switching_benefit(self):
+        self.compact(3)
+        self.assertFalse(self.prep(benefit=False)["prepared"])
+        self.assertTrue(self.prep(benefit=True)["prepared"])
+
+    def test_custom_interval_persists_for_existing_session(self):
+        for _ in range(2):
+            m.process(self.event("PostCompact", trigger="auto"), self.root, interval=2)
+        self.assertTrue(self.prep()["prepared"])
+        self.hook("Stop", last_assistant_message=NOTICE)
+        self.assertEqual(self.status()["next_reminder_at"], 4)
+        self.reply("continue")
+        self.assertEqual(self.status()["evaluation_interval"], 2)
+        self.assertEqual(self.status()["next_reminder_at"], 4)
+
+    def test_legacy_interval_default_preserves_existing_cooldown(self):
+        self.delivered()
+        path = m.state_path(self.root, self.sid)
+        saved = self.status()
+        del saved["evaluation_interval"]
+        path.write_text(json.dumps(saved), encoding="utf-8")
+        before = path.read_bytes()
+        current = m.process(self.event(""), self.root, "status", interval=1)
+        self.assertEqual(current["evaluation_interval"], 3)
+        self.assertEqual(current["next_reminder_at"], 6)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_context_provides_identity_without_full_rules_when_idle(self):
+        self.compact()
+        context = self.hook("UserPromptSubmit")["hookSpecificOutput"]["additionalContext"]
+        identity = json.loads(context.split("\n")[0].split(" ", 1)[1])
+        self.assertEqual(identity["session_id"], self.sid)
+        self.assertEqual(identity["turn_id"], self.turn)
+        self.assertEqual(identity["state_dir"], str(self.root.resolve()))
+        self.assertNotIn("references/compaction-reminder.md", context)
+        self.compact(2)
+        actionable = self.hook("UserPromptSubmit")["hookSpecificOutput"]["additionalContext"]
+        self.assertGreater(len(actionable), len(context))
+
+
+    def test_hook_observations_keep_metadata_but_not_private_message(self):
+        self.compact(3)
+        self.prep()
+        secret = "private text must not be logged"
+        self.hook("Stop", last_assistant_message=NOTICE + "\n\n" + secret)
+        state = self.status()
+        observation = state["hook_observations"]["Stop"]
+        self.assertTrue(observation["final_delivered"])
+        self.assertEqual(observation["decision"], "allow")
+        self.assertEqual(state["hook_observations"]["PostCompact"]["trigger"], "auto")
+        self.assertNotIn(secret, json.dumps(state))
+        self.assertEqual(observation["final_sha256"], hashlib.sha256((NOTICE + "\n\n" + secret).encode()).hexdigest())
+
+    def test_hook_observations_are_bounded_and_manual_compact_is_ignored(self):
+        self.compact()
+        before = self.status()
+        self.hook("PostCompact", trigger="manual")
+        self.assertEqual(self.status(), before)
+        for i in range(20):
+            self.hook("SessionStart", source="resume")
+        self.assertEqual(set(self.status()["hook_observations"]), {"PostCompact", "SessionStart"})
 
 
 if __name__ == "__main__":
@@ -522,6 +654,7 @@ if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReminderTests)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     record = {"tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
+              "skipped": [{"test": str(t), "reason": reason} for t, reason in result.skipped],
               "seconds": round(time.time()-started, 3), "fixture_dir": str(RUN),
               "failure_details": [{"test": str(t), "traceback": detail}
                                   for t, detail in result.failures + result.errors]}

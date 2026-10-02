@@ -57,13 +57,20 @@ def is_subagent(event):
         try:
             with Path(transcript).open(encoding="utf-8-sig") as handle:
                 record = json.loads(handle.readline(65536))
-            if record.get("type") == "session_meta":
+            if isinstance(record, dict) and record.get("type") == "session_meta":
                 meta = record.get("payload", {})
+                if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
+                    raise ValueError("unrecognized transcript metadata")
                 source = meta.get("source")
+                if isinstance(source, dict) and "subagent" not in source:
+                    raise ValueError("unrecognized transcript source")
                 return (meta.get("id") != event.get("session_id") or
                         (isinstance(source, dict) and "subagent" in source))
-        except (OSError, ValueError):
-            pass  # Metadata is optional; lifecycle fields remain authoritative.
+            raise ValueError("unrecognized transcript metadata")
+        except (OSError, ValueError) as error:
+            # An unreadable supplied transcript cannot establish root ownership.
+            # Surface uncertainty without counting a possibly unrelated agent.
+            raise ValueError("cannot establish transcript ownership") from error
     return False
 
 
@@ -71,19 +78,27 @@ def state_path(root, session):
     return root / (hashlib.sha256(session.encode()).hexdigest() + ".json")
 
 
-def read_state(path, session):
+def read_state(path, session, interval=INTERVAL):
+    if type(interval) is not int or not 1 <= interval <= 100:
+        raise ValueError("interval must be between 1 and 100")
     state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
         "schema": 1, "session_id": session, "auto_count": 0,
-        "next_reminder_at": INTERVAL, "muted": False,
+        "next_reminder_at": interval, "evaluation_interval": interval, "muted": False,
         "last_notified_at": None, "last_reason": None,
         "response": None, "coverage": "observed_since_hook_enabled",
     }
-    if (state.get("schema") != 1 or state.get("session_id") != session or
+    if (not isinstance(state, dict) or
+            state.get("schema") != 1 or state.get("session_id") != session or
             type(state.get("auto_count")) is not int or state["auto_count"] < 0 or
             type(state.get("next_reminder_at")) is not int or
-            state["next_reminder_at"] < INTERVAL or
+            state["next_reminder_at"] < 1 or
             type(state.get("muted")) is not bool):
         raise ValueError("invalid state; original file preserved")
+    # Existing sessions keep their interval and cooldown when configuration changes.
+    state.setdefault("evaluation_interval", INTERVAL)
+    if (type(state["evaluation_interval"]) is not int or
+            not 1 <= state["evaluation_interval"] <= 100):
+        raise ValueError("invalid evaluation interval")
     # Additive extension: old adapters can still read the original fields.
     # A legacy receipt contains a compaction index, not a notification total.
     if "tracking_version" not in state:
@@ -119,7 +134,7 @@ def read_state(path, session):
                     state["stage_keys"] = [k for k in state["stage_keys"] if k != proposal["stage_key"]]
                 state["last_notified_at"] = None
                 if state["response"] == "pending":
-                    state["next_reminder_at"] = INTERVAL
+                    state["next_reminder_at"] = state["evaluation_interval"]
         else:
             state["reminder_count"] = None
         state["tracked_reminder_count"] = 0
@@ -127,7 +142,53 @@ def read_state(path, session):
     if (state.get("evaluation") is not None and not isinstance(state["evaluation"], dict)) or (
             state.get("stop_audit") is not None and not isinstance(state["stop_audit"], dict)):
         raise ValueError("invalid evaluation state")
+    validate_state(state)
     return state
+
+
+def validate_state(state):
+    """Validate nested persisted data before any business-state mutation."""
+    for field in ("active_turn_id", "last_response_turn_id", "defer_until"):
+        value = state.get(field)
+        if value is not None:
+            key_arg(value, field)
+    if (state.get("last_notified_at") is not None and
+            (type(state["last_notified_at"]) is not int or
+             not 0 <= state["last_notified_at"] <= state["auto_count"])):
+        raise ValueError("invalid notification count")
+    for field in ("stage_keys", "confusion_keys"):
+        for item in state[field]:
+            key_arg(item, field)
+    proposal = state.get("proposal")
+    if proposal is not None:
+        for field in ("id", "turn_id", "stage_key"):
+            key_arg(proposal.get(field), field)
+        if proposal.get("reason") not in {"count", "stage", "confusion", "checkpoint"}:
+            raise ValueError("invalid proposal reason")
+        if proposal.get("cause_key") is not None:
+            key_arg(proposal["cause_key"], "cause_key")
+        notice = proposal.get("notice")
+        if (not isinstance(notice, str) or not 20 <= len(notice) <= 600 or
+                not notice.startswith("交接建议：") or "\n" in notice or "\r" in notice):
+            raise ValueError("invalid proposal notice")
+        for field in ("counted", "commentary_delivered", "final_delivered",
+                      "retry_used", "final_missed", "closed"):
+            if type(proposal.get(field)) is not bool:
+                raise ValueError("invalid proposal flags")
+    evaluation = state.get("evaluation")
+    if evaluation is not None:
+        key_arg(evaluation.get("turn_id"), "evaluation turn")
+        key_arg(evaluation.get("note"), "evaluation note")
+        if (type(evaluation.get("auto_count")) is not int or
+                not 0 <= evaluation["auto_count"] <= state["auto_count"] or
+                evaluation.get("decision") not in {"defer", "skip", "remind"} or
+                evaluation.get("next_check") not in {"next_turn", "next_compaction"}):
+            raise ValueError("invalid evaluation fields")
+    audit = state.get("stop_audit")
+    if audit is not None:
+        key_arg(audit.get("turn_id"), "stop turn")
+        if type(audit.get("retry_used")) is not bool or type(audit.get("missed")) is not bool:
+            raise ValueError("invalid stop flags")
 
 
 def evaluation_due(state, turn):
@@ -169,12 +230,14 @@ def prepare(state, event, reason, opts):
         raise ValueError("turn_id differs from the current host event")
     stage = key_arg(opts.get("stage_key"), "stage_key")
     notice = opts.get("notice", "").strip()
-    if not notice.startswith("交接建议：") or not 20 <= len(notice) <= 600 or "\n" in notice:
+    if not notice.startswith("交接建议：") or not 20 <= len(notice) <= 600 or "\n" in notice or "\r" in notice:
         raise ValueError("notice must be one bounded handoff suggestion paragraph")
     if reason not in {"count", "stage", "confusion", "checkpoint"}:
         raise ValueError("invalid reminder reason")
     if state["muted"] or not opts.get("safe") or not opts.get("has_next"):
         return {"prepared": False, "why": "muted_or_not_ready"}
+    if reason in {"count", "stage", "confusion"} and not opts.get("benefit"):
+        return {"prepared": False, "why": "no_switching_benefit"}
     old = state["proposal"]
     # Re-arm an interrupted/missed delivery, keeping the same ID and count.
     if (old and not old["closed"] and not old["final_delivered"] and
@@ -236,7 +299,7 @@ def receipt(state, proposal, channel):
             state["reminder_count"] += 1
         state["last_notified_at"] = state["auto_count"]
         state["last_reason"] = proposal["reason"]
-        state["next_reminder_at"] = max(state["next_reminder_at"], state["auto_count"] + INTERVAL)
+        state["next_reminder_at"] = max(state["next_reminder_at"], state["auto_count"] + state["evaluation_interval"])
         if proposal["stage_key"] not in state["stage_keys"]:
             state["stage_keys"].append(proposal["stage_key"])
         if proposal["reason"] == "confusion":
@@ -245,9 +308,14 @@ def receipt(state, proposal, channel):
 
 def respond(state, event, response, opts):
     turn = key_arg(event.get("turn_id"), "response turn_id")
+    if state.get("active_turn_id") and turn != state["active_turn_id"]:
+        raise ValueError("response must use current host turn")
     if response not in {"continue", "defer", "mute", "handoff", "resume"}:
         raise ValueError("invalid response")
     if state["last_response_turn_id"] == turn:
+        if response != state["response"] or (response == "defer" and
+                opts.get("checkpoint_key") != state["defer_until"]):
+            raise ValueError("conflicting response in the same turn")
         return  # Re-reading the same response must not slide the cooldown.
     proposal = state["proposal"]
     if response not in {"mute", "resume"}:
@@ -264,7 +332,7 @@ def respond(state, event, response, opts):
     elif response == "resume":
         state["muted"] = False
     else:
-        state["next_reminder_at"] = max(state["next_reminder_at"], state["auto_count"] + INTERVAL)
+        state["next_reminder_at"] = max(state["next_reminder_at"], state["auto_count"] + state["evaluation_interval"])
     if proposal:
         proposal["closed"] = True
         if proposal["stage_key"] not in state["stage_keys"]:
@@ -274,17 +342,23 @@ def respond(state, event, response, opts):
 def final_contains_notice(message, notice):
     if not isinstance(message, str):
         return False
-    # Only inspect the host-supplied final text, excluding quoted/code examples.
+    # Accept only the first top-level paragraph. Code, quotes, cards and lists
+    # before it are not a delivered front notice. This is deliberately conservative.
     message = message.split("<oai-mem-citation>", 1)[0]
-    lines, fenced = [], False
-    for line in message.splitlines():
-        if line.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and not line.lstrip().startswith(">"):
-            lines.append(line)
-    normalize = lambda value: re.sub(r"[\s*`_]", "", value)
-    paragraphs = [p for p in re.split(r"\n\s*\n", "\n".join(lines)) if p.strip()]
-    return bool(paragraphs) and normalize(paragraphs[0]) == normalize(notice)
+    lines = message.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    paragraph = []
+    for line in lines:
+        if not line.strip():
+            break
+        expanded = line.expandtabs(4)
+        if (len(expanded) - len(expanded.lstrip(" ")) >= 4 or
+                re.match(r"^ {0,3}(?:[>`~<#]|::|[-+*] |\d+[.)] )", line)):
+            return False
+        paragraph.append(line.strip())
+    normalize = lambda value: re.sub(r"[\s*_]", "", value)
+    return bool(paragraph) and normalize("".join(paragraph)) == normalize(notice)
 
 
 def check_stop(state, event):
@@ -328,39 +402,42 @@ def check_stop(state, event):
     return {"systemMessage": "project-handoff：评估或最终提醒仍未核验，本轮停止补漏；未计为正式提醒。"}
 
 
-def context_output(state, name):
+def context_output(state, name, root):
     count = state["auto_count"]
     if count == 0 and not state["proposal"] and not state["muted"]:
         return {}
     total = (str(state["reminder_count"]) + "次" if state["reminder_count"] is not None else
              f"历史最终总数未知，新版已核验{state['tracked_reminder_count']}次")
-    base = f"project-handoff：自动压缩{count}次；最终文本提醒{total}；"
-    if state.get("active_turn_id"):
-        base += f"当前turn_id={state['active_turn_id']}；"
-    if state["last_notified_at"] is not None:
-        base += f"提醒冷却参考第{state['last_notified_at']}次压缩。"
+    identity = dict(session_id=state["session_id"], turn_id=state.get("active_turn_id"),
+                    state_dir=str(root.resolve()))
+    base = "project-handoff " + json.dumps(identity, ensure_ascii=False, separators=(",", ":")) + "\n"
+    actionable = False
     if state["muted"]:
-        context = "本任务主动提醒已关闭；显式交接或恢复提醒请求仍执行。"
+        context = "已静默；仅处理显式交接或恢复提醒请求。"
     elif state["defer_until"]:
         context = f"等待用户指定节点{state['defer_until']}；节点到达才评估，普通次数不催促。"
     elif state["proposal"] and not state["proposal"]["closed"] and not state["proposal"]["final_delivered"]:
+        actionable = True
         context = ("存在尚未最终展示的建议。先核对最新回应：仍适用则按原标识重新 prepare，"
                    "放在最终正文最前；不适用则 evaluate 或 cancel。进度提醒不计正式次数。")
     elif evaluation_due(state, state.get("active_turn_id")):
+        actionable = True
         context = ("本次压缩检查点待评估：最终答复前执行 prepare 或 evaluate。"
                    "prepare 成功才提醒；不提醒须记录原因及下次检查时机。"
-                   "首次到三次需安全位置和后续；再次提醒还需新阶段与具体收益。")
+                   "首次也须有具体切换收益；再次提醒须新阶段。")
     elif state["auto_count"] < state["next_reminder_at"]:
         context = f"冷却至第{state['next_reminder_at']}次压缩；新阶段不越过冷却。"
     else:
         context = "本次压缩点已评估；新实质阶段仍应评估，不重复同阶段提醒。"
-    context += (f"执行前读取{SKILL}及references/compaction-reminder.md。"
-                "新且已核实的混淆先纠正，可提前提醒；同一问题去重，静默优先。"
-                "纯问答、无后续或讨论/修改本Skill不提醒。注入不算送达，普通继续不算交接批准。")
+    if actionable:
+        context += (f"自动压缩{count}次；最终提醒{total}。读取{SKILL}及references/compaction-reminder.md；"
+                    "纯问答、无后续或讨论本Skill登记skip，普通继续不授权交接。")
     return {"hookSpecificOutput": {"hookEventName": name, "additionalContext": base + context}}
 
 
 def process(event, root, action="hook", response=None, reason=None, **opts):
+    if not isinstance(event, dict):
+        raise ValueError("event must be an object")
     session = event.get("session_id")
     if not isinstance(session, str) or not session or len(session) > 256:
         raise ValueError("missing or invalid session_id")
@@ -374,11 +451,11 @@ def process(event, root, action="hook", response=None, reason=None, **opts):
             return {}
     path = state_path(root, session)
     if action == "status":
-        return read_state(path, session)  # No mkdir, lock file, migration or write.
+        return read_state(path, session, opts.get("interval", INTERVAL))
     if action == "hook" and name != "PostCompact" and not path.exists():
         return {}
     with locked(path.with_suffix(".lock")):
-        state = read_state(path, session)
+        state = read_state(path, session, opts.get("interval", INTERVAL))
         before = json.dumps(state, sort_keys=True, ensure_ascii=False)
         result = None
         if action == "hook" and name != "Stop" and event.get("turn_id"):
@@ -420,6 +497,24 @@ def process(event, root, action="hook", response=None, reason=None, **opts):
             result = check_stop(state, event)
         elif action != "hook":
             raise ValueError("invalid action")
+        if action == "hook":
+            # Bounded metadata only; never retain prompts or final message text.
+            observations = state.setdefault("hook_observations", {})
+            observation = dict(at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                               turn_id=event.get("turn_id"), auto_count=state["auto_count"])
+            if name == "PostCompact":
+                observation["trigger"] = event.get("trigger")
+            if name == "SessionStart":
+                observation["source"] = event.get("source")
+            if name == "Stop":
+                message = event.get("last_assistant_message")
+                observation["final_sha256"] = (hashlib.sha256(message.encode()).hexdigest()
+                                                if isinstance(message, str) else None)
+                observation["decision"] = (result or {}).get("decision", "allow")
+                observation["final_delivered"] = bool(state["proposal"] and
+                    state["proposal"].get("turn_id") == event.get("turn_id") and
+                    state["proposal"].get("final_delivered"))
+            observations[name] = observation
         if json.dumps(state, sort_keys=True, ensure_ascii=False) != before:
             state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             temp = path.with_suffix(".tmp")
@@ -432,12 +527,14 @@ def process(event, root, action="hook", response=None, reason=None, **opts):
             return result
         if name == "PostCompact":
             return {}
-        return context_output(state, name)
+        return context_output(state, name, root)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", type=Path, required=True)
+    parser.add_argument("--interval", type=int, default=INTERVAL,
+                        help="evaluation interval for new sessions (1-100); existing sessions keep theirs")
     parser.add_argument("--action", choices=["hook", "status", "evaluate", "prepare", "notified", "respond", "cancel"],
                         default="hook")
     parser.add_argument("--session-id")

@@ -1,0 +1,6 @@
+interface:
+  display_name: "网页替身"
+  short_description: "自动分流较重独立任务到 ChatGPT，保存原文与摘要并核验采纳"
+  default_prompt: "使用 $web-stand-in 完成这项独立研究，自动收取原文与摘要，核验后接回当前任务。"
+policy:
+  allow_implicit_invocation: true

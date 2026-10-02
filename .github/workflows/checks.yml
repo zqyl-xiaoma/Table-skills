@@ -1,4 +1,4 @@
-name: Windows checks
+name: Skill checks
 
 on:
   push:
@@ -10,20 +10,40 @@ permissions:
 
 jobs:
   scripts:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
-    defaults:
-      run:
-        shell: pwsh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: '3.14'
+          python-version: ${{ matrix.python }}
       - name: Confirm PowerShell 7
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'PowerShell 7 required' }
       - name: Project handoff regression
-        run: python -B -X utf8 tests/test_project_handoff.py
+        run: python -B -X utf8 -m unittest discover -s tests -v
+  browser-job:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Web stand-in local regression
+        run: node --test tests/test_web_stand_in.mjs tests/test_web_workflow.mjs

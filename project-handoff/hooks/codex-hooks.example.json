@@ -6,8 +6,8 @@
           {
             "type": "command",
             "additionalContextLimit": 1000,
-            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
-            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
+            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
+            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
             "timeout": 5
           }
         ],
@@ -20,8 +20,8 @@
           {
             "type": "command",
             "additionalContextLimit": 1000,
-            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
-            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
+            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
+            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
             "timeout": 5
           }
         ]
@@ -32,8 +32,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
-            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
+            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
+            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
             "timeout": 5
           }
         ],
@@ -45,8 +45,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
-            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<CODEX_HOME>/state/project-handoff\"",
+            "command": "\"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
+            "commandWindows": "& \"<PYTHON_EXE>\" -X utf8 \"<SKILL_DIRECTORY>/scripts/compaction_reminder.py\" --state-dir \"<STATE_DIRECTORY>\"",
             "timeout": 5
           }
         ]
